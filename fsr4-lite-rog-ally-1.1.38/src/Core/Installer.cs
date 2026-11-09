@@ -1,0 +1,583 @@
+namespace RalFsrHelper.Core;
+
+/// <summary>
+/// Installs OptiScaler plus the FSR 4 files into a game's exe folder with the Lite settings pre-set,
+/// and removes them again. Every change is recorded in the manifest before the next one is made,
+/// so a failed install can always be rolled back.
+/// </summary>
+public static class Installer
+{
+    public static InstallManifest Install(GameScan scan, OptiPackage opti, Fsr4Set fsr4, AppSettings settings,
+        InstallConfig.OverlayLook? overlayLook = null)
+    {
+        var exeDir = scan.ExeDir ?? throw new InvalidOperationException("No exe folder for this game.");
+        if (!fsr4.IsUsable) throw new InvalidOperationException("Import the FSR 4 files first.");
+        if (InstallManifest.TryLoad(exeDir) is not null) throw new InvalidOperationException("Already installed.");
+
+        var proxy = PickProxyName(exeDir, scan.ExeName, scan.Game.Source);
+        var manifest = new InstallManifest
+        {
+            GameKey = scan.Game.Key,
+            Source = scan.Game.Source.ToString(),
+            GameName = scan.Game.Name,
+            ProxyName = proxy,
+            ExeName = Path.GetFileName(scan.ExeName ?? ""),
+            OptiBuild = opti.Build,
+            Fsr4Version = fsr4.VersionLabel,
+        };
+
+        try
+        {
+            Directory.CreateDirectory(InstallManifest.MetaDir(exeDir));
+            manifest.Save(exeDir);
+
+            // 1. OptiScaler package, with OptiScaler.dll renamed to the proxy name.
+            foreach (var source in Directory.GetFiles(opti.Dir, "*", SearchOption.AllDirectories))
+            {
+                var rel = Path.GetRelativePath(opti.Dir, source);
+                if (InstallConfig.SkipPackageFiles.Contains(Path.GetFileName(rel), StringComparer.OrdinalIgnoreCase)) continue;
+                if (Path.GetFileName(rel).StartsWith("!!", StringComparison.Ordinal)) continue; // readme stubs
+
+                if (rel.Equals("OptiScaler.dll", StringComparison.OrdinalIgnoreCase)) rel = proxy;
+                PlaceFile(source, exeDir, rel, manifest);
+            }
+
+            // 2. FSR 4 driver files into the OptiScaler subfolder (v10 layout).
+            var sub = InstallConfig.OptiSubfolder;
+            if (fsr4.Dx12 is not null)
+                PlaceFile(fsr4.Dx12.Path, exeDir, Path.Combine(sub, InstallConfig.Dx12Fsr4File), manifest);
+            if (fsr4.Vulkan is not null)
+                PlaceFile(fsr4.Vulkan.Path, exeDir, Path.Combine(sub, InstallConfig.VulkanFsr4File), manifest);
+
+            // 3. Settings that replace the in-game menu steps.
+            var ini = Path.Combine(exeDir, "OptiScaler.ini");
+            if (!manifest.CreatedFiles.Contains("OptiScaler.ini", StringComparer.OrdinalIgnoreCase))
+            {
+                // Package had no ini: track the one we are about to create.
+                RecordNewFile(exeDir, "OptiScaler.ini", manifest);
+            }
+            IniFile.SetValues(ini, InstallConfig.Base(fsr4.Vulkan is not null)
+                .Concat(InstallConfig.Overlay(settings.ShowResolutionOverlay, overlayLook, settings.OverlayPosition))
+                .Concat(InstallConfig.Watermark(settings.ShowFsr4Watermark)));
+
+            manifest.InstalledAt = DateTime.Now;
+            manifest.Save(exeDir);
+            Log.Info($"Installed into {exeDir} as {proxy} (OptiScaler {opti.Build}, FSR 4 {manifest.Fsr4Version})");
+            return manifest;
+        }
+        catch (Exception ex)
+        {
+            Log.Error($"Install failed for {scan.Game.Name}, rolling back", ex);
+            try { Uninstall(exeDir, manifest); }
+            catch (Exception rollbackEx) { Log.Error("Rollback failed", rollbackEx); }
+            throw;
+        }
+    }
+
+    public static void Uninstall(string exeDir, InstallManifest? manifest = null)
+    {
+        manifest ??= InstallManifest.TryLoad(exeDir) ?? throw new InvalidOperationException("No install record found.");
+
+        // Frame generation's Unreal Engine.ini line lives outside the game folder, so it's taken out separately.
+        FrameGen.UndoEngineIni(manifest.FrameGen);
+
+        foreach (var rel in manifest.CreatedFiles)
+        {
+            DeleteFile(Path.Combine(exeDir, rel));
+        }
+
+        // Files OptiScaler writes while running.
+        DeleteFile(Path.Combine(exeDir, "OptiScaler.log"));
+
+        // Files and folders REFramework creates while running (config, log, its reframework folder), unless the game
+        // already had them before FSR 4.1 Lite added REFramework.
+        if (manifest.REFrameworkVersion.Length > 0)
+        {
+            foreach (var path in REFrameworkArtifacts(exeDir))
+            {
+                if (manifest.REFrameworkPreexisting.Contains(Path.GetFileName(path), StringComparer.OrdinalIgnoreCase)) continue;
+                try
+                {
+                    if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+                    else DeleteFile(path);
+                }
+                catch (Exception ex)
+                {
+                    Log.Warn($"Couldn't remove REFramework file {path}: {ex.Message}");
+                }
+            }
+        }
+
+        // OptiPatcher's plugins folder, when FSR 4.1 Lite made it and nothing else is in it (its .asi went with
+        // CreatedFiles above). A plugins folder with the player's own files stays.
+        if (manifest.OptiPatcherMadePluginsDir && manifest.OptiPatcherFile.Length > 0)
+        {
+            var plugins = Path.Combine(exeDir, Path.GetDirectoryName(manifest.OptiPatcherFile)!);
+            if (Directory.Exists(plugins) && !Directory.EnumerateFileSystemEntries(plugins).Any()) Directory.Delete(plugins);
+        }
+
+        foreach (var rel in manifest.CreatedDirs.OrderByDescending(d => d.Length))
+        {
+            var dir = Path.Combine(exeDir, rel);
+            if (Directory.Exists(dir)) DeleteCreatedDir(dir);
+        }
+
+        var backupRoot = InstallManifest.BackupDir(exeDir);
+        foreach (var rel in manifest.BackedUpFiles)
+        {
+            var backup = Path.Combine(backupRoot, rel);
+            if (!File.Exists(backup)) continue;
+            var target = Path.Combine(exeDir, rel);
+            Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+            File.Copy(backup, target, overwrite: true);
+        }
+
+        var meta = InstallManifest.MetaDir(exeDir);
+        if (Directory.Exists(meta)) Directory.Delete(meta, recursive: true);
+        Log.Info($"Removed install from {exeDir}");
+    }
+
+    /// <summary>
+    /// Copies newly imported FSR 4 files over the ones in an installed game. Only touches files this app created.
+    /// Returns false if the game has the files locked (it's running).
+    /// </summary>
+    public static bool RefreshFsr4(string exeDir, Fsr4Set fsr4)
+    {
+        var manifest = InstallManifest.TryLoad(exeDir);
+        if (manifest is null) return true;
+        try
+        {
+            foreach (var (file, name) in new[] { (fsr4.Dx12, InstallConfig.Dx12Fsr4File), (fsr4.Vulkan, InstallConfig.VulkanFsr4File) })
+            {
+                if (file is null) continue;
+                var rel = Path.Combine(InstallConfig.OptiSubfolder, name);
+                Directory.CreateDirectory(Path.Combine(exeDir, InstallConfig.OptiSubfolder));
+                if (!File.Exists(Path.Combine(exeDir, rel))) RecordNewFile(exeDir, rel, manifest);
+                File.Copy(file.Path, Path.Combine(exeDir, rel), overwrite: true);
+            }
+            // A newly imported Vulkan file switches Vulkan games to the native path.
+            var ini = Path.Combine(exeDir, "OptiScaler.ini");
+            if (File.Exists(ini)) IniFile.SetValues(ini, new[] { InstallConfig.VulkanUpscaler(fsr4.Vulkan is not null) });
+
+            manifest.Fsr4Version = fsr4.VersionLabel;
+            manifest.Save(exeDir);
+            return true;
+        }
+        catch (IOException ex)
+        {
+            Log.Warn($"FSR 4 refresh skipped for {exeDir}: {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>Changes only the overlay keys in an installed game's ini.</summary>
+    public static void ApplyOverlay(string exeDir, bool on, InstallConfig.OverlayLook? look = null, string position = "topleft")
+    {
+        var ini = Path.Combine(exeDir, "OptiScaler.ini");
+        if (File.Exists(ini)) IniFile.SetValues(ini, InstallConfig.Overlay(on, look, position));
+    }
+
+    private static readonly Dictionary<string, bool> KnownKeys = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// True when an OptiScaler DLL reads the given ini key (its name is in the DLL). Lets newer settings, such as
+    /// FpsOverlayFontSize, be used only with builds that have them. Remembered per file, size and date.
+    /// </summary>
+    public static bool OptiReadsKey(string dllPath, string key)
+    {
+        try
+        {
+            var info = new FileInfo(dllPath);
+            if (!info.Exists) return false;
+            var id = $"{info.FullName}|{info.Length}|{info.LastWriteTimeUtc.Ticks}|{key}";
+            lock (KnownKeys)
+                if (KnownKeys.TryGetValue(id, out var known)) return known;
+
+            var needle = System.Text.Encoding.ASCII.GetBytes(key);
+            var found = File.ReadAllBytes(dllPath).AsSpan().IndexOf(needle) >= 0;
+            lock (KnownKeys) KnownKeys[id] = found;
+            return found;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>Sets this game's render resolution (OptiScaler's upscale ratio override) and remembers it.</summary>
+    public static void ApplyRenderScale(string exeDir, string key)
+    {
+        if (InstallConfig.RenderScales.All(r => r.Key != key)) key = "game";
+        var manifest = InstallManifest.TryLoad(exeDir);
+        if (manifest is null) return;
+
+        var ini = Path.Combine(exeDir, "OptiScaler.ini");
+        if (File.Exists(ini)) IniFile.SetValues(ini, InstallConfig.RenderScale(key));
+
+        if (manifest.RenderScale != key)
+        {
+            manifest.RenderScale = key;
+            manifest.Save(exeDir);
+        }
+    }
+
+    /// <summary>
+    /// Writes a game's frame generation settings into OptiScaler.ini, and adds or removes the Unreal Engine.ini fix: only
+    /// for OptiFG in Unreal games that offer DLSS, where OptiScaler's wiki says dilated motion vectors smear.
+    /// </summary>
+    public static void ApplyFrameGen(string exeDir, InstallManifest manifest, bool unrealWithDlss)
+    {
+        var fg = manifest.FrameGen;
+        var wantEngineIni = fg.Enabled && fg.Input == FrameGen.OptiFg && unrealWithDlss;
+        if (wantEngineIni) FrameGen.ApplyEngineIni(exeDir, fg);
+        else if (!fg.Enabled || fg.Input != FrameGen.OptiFg) FrameGen.UndoEngineIni(fg);
+        manifest.Save(exeDir);
+
+        var ini = Path.Combine(exeDir, "OptiScaler.ini");
+        if (File.Exists(ini)) IniFile.SetValues(ini, FrameGen.IniValues(fg));
+    }
+
+    /// <summary>Frame generation fully off, with the Engine.ini fix taken out. The player's choices stay remembered.</summary>
+    public static void TurnOffFrameGen(string exeDir, InstallManifest manifest)
+    {
+        manifest.FrameGen.Enabled = false;
+        FrameGen.UndoEngineIni(manifest.FrameGen);
+        var ini = Path.Combine(exeDir, "OptiScaler.ini");
+        if (File.Exists(ini)) IniFile.SetValues(ini, FrameGen.IniValues(manifest.FrameGen));
+    }
+
+    /// <summary>Changes only the watermark key in an installed game's ini.</summary>
+    public static void ApplyWatermark(string exeDir, bool on)
+    {
+        var ini = Path.Combine(exeDir, "OptiScaler.ini");
+        if (File.Exists(ini)) IniFile.SetValues(ini, InstallConfig.Watermark(on));
+    }
+
+    /// <summary>
+    /// Renames OptiScaler's loader to another name the game doesn't already use. Some games, often Game Pass ones,
+    /// ignore one name and load another. Names the game's exe loads at startup come first, since Windows always looks
+    /// for those in the game's folder. Automatic switches skip every name the game already ignored and return null when
+    /// none is left; the manual button starts over once all were tried. Frame generation settings stay as they are:
+    /// OptiScaler never ran under the old name, so they can't be what stopped it.
+    /// </summary>
+    public static string? SwitchProxy(string exeDir, bool automatic = false)
+    {
+        var manifest = InstallManifest.TryLoad(exeDir) ?? throw new InvalidOperationException("FSR 4.1 Lite isn't installed here.");
+        if (!manifest.TriedLoaders.Contains(manifest.ProxyName, StringComparer.OrdinalIgnoreCase))
+            manifest.TriedLoaders.Add(manifest.ProxyName);
+
+        var free = OrderForExe(exeDir, manifest.ExeName)
+            .Where(n => !n.Equals(manifest.ProxyName, StringComparison.OrdinalIgnoreCase))
+            .Where(n => !File.Exists(Path.Combine(exeDir, n)))
+            .ToList();
+        var next = free.FirstOrDefault(n => !manifest.TriedLoaders.Contains(n, StringComparer.OrdinalIgnoreCase));
+        if (next is null && !automatic)
+        {
+            // Every name was tried: the manual button goes round again, after the current one.
+            var names = InstallConfig.ProxyNames;
+            var start = Array.FindIndex(names, n => n.Equals(manifest.ProxyName, StringComparison.OrdinalIgnoreCase));
+            next = Enumerable.Range(1, names.Length).Select(i => names[(start + i + names.Length) % names.Length])
+                .FirstOrDefault(free.Contains);
+            if (next is null) throw new InvalidOperationException("Every loader name is already used by the game.");
+        }
+        if (next is null)
+        {
+            manifest.Save(exeDir);
+            return null;
+        }
+
+        var from = Path.Combine(exeDir, manifest.ProxyName);
+        if (File.Exists(from)) File.Move(from, Path.Combine(exeDir, next));
+
+        var index = manifest.CreatedFiles.FindIndex(f => f.Equals(manifest.ProxyName, StringComparison.OrdinalIgnoreCase));
+        if (index >= 0) manifest.CreatedFiles[index] = next; else manifest.CreatedFiles.Add(next);
+        manifest.ProxyName = next;
+        manifest.InstalledAt = DateTime.Now; // the next launch counts as "after the change"
+        manifest.Save(exeDir);
+        Log.Info($"Switched OptiScaler loader in {exeDir} to {next} ({(automatic ? "automatic" : "button")}, " +
+                 $"ignored: {string.Join(", ", manifest.TriedLoaders)})");
+        return next;
+    }
+
+    /// <summary>
+    /// Loader names in the order to try for this exe: names the exe imports (Windows loads those from the game folder
+    /// at startup, before anything else can skip it) first, then the usual order.
+    /// </summary>
+    private static IEnumerable<string> OrderForExe(string exeDir, string? exeName)
+    {
+        var imports = ImportsOf(exeDir, exeName);
+        return InstallConfig.ProxyNames.Where(n => imports.Dlls.Contains(n))
+            .Concat(InstallConfig.ProxyNames.Where(n => !imports.Dlls.Contains(n)));
+    }
+
+    private static ExeImports ImportsOf(string exeDir, string? exeName) =>
+        string.IsNullOrEmpty(exeName) ? new ExeImports() : ExeImports.Read(Path.Combine(exeDir, Path.GetFileName(exeName)));
+
+    /// <summary>
+    /// Brings an installed game up to a newer OptiScaler build: copies the package's files over the old ones, keeping the
+    /// game's loader name. OptiScaler.ini is never replaced, so the game keeps its settings (render resolution, loader,
+    /// FSR 2 inputs); the FSR 4 files aren't part of the package and stay as they are. Files the game shipped itself are
+    /// backed up first, exactly like a fresh install, so Uninstall still restores the folder byte for byte.
+    /// The game must not be running. Returns false when it was already on this build.
+    /// </summary>
+    public static bool UpdateOpti(string exeDir, OptiPackage opti)
+    {
+        var manifest = InstallManifest.TryLoad(exeDir) ?? throw new InvalidOperationException("FSR 4.1 Lite isn't installed here.");
+        if (manifest.OptiBuild.Equals(opti.Build, StringComparison.OrdinalIgnoreCase)) return false;
+
+        foreach (var source in Directory.GetFiles(opti.Dir, "*", SearchOption.AllDirectories))
+        {
+            var rel = Path.GetRelativePath(opti.Dir, source);
+            var name = Path.GetFileName(rel);
+            if (InstallConfig.SkipPackageFiles.Contains(name, StringComparer.OrdinalIgnoreCase)) continue;
+            if (name.StartsWith("!!", StringComparison.Ordinal)) continue;
+            if (rel.Equals("OptiScaler.ini", StringComparison.OrdinalIgnoreCase)) continue; // keep the game's settings
+
+            if (rel.Equals("OptiScaler.dll", StringComparison.OrdinalIgnoreCase)) rel = manifest.ProxyName;
+            PlaceFile(source, exeDir, rel, manifest);
+        }
+
+        var previous = manifest.OptiBuild;
+        manifest.OptiBuild = opti.Build;
+        manifest.Save(exeDir);
+        Log.Info($"Updated OptiScaler in {exeDir}: {previous} -> {opti.Build}");
+        return true;
+    }
+
+    public enum RefResult { Installed, Updated, AlreadyCurrent, GameHasOwnDinput8 }
+
+    /// <summary>
+    /// Adds (or refreshes) REFramework's dinput8.dll next to the game exe, tracked in the manifest like every other file.
+    /// If the game already has a dinput8.dll that FSR 4.1 Lite didn't put there (the player's own REFramework or another
+    /// mod), it's left alone.
+    /// </summary>
+    public static RefResult AddREFramework(string exeDir, RefPackage pkg)
+    {
+        var manifest = InstallManifest.TryLoad(exeDir) ?? throw new InvalidOperationException("FSR 4.1 Lite isn't installed here.");
+        const string name = "dinput8.dll";
+        var ours = manifest.CreatedFiles.Contains(name, StringComparer.OrdinalIgnoreCase);
+        if (!ours && File.Exists(Path.Combine(exeDir, name))) return RefResult.GameHasOwnDinput8;
+        if (ours && manifest.REFrameworkVersion.Equals(pkg.Version, StringComparison.OrdinalIgnoreCase))
+        {
+            HideREFrameworkMenuAtStartup(exeDir, manifest);
+            return RefResult.AlreadyCurrent;
+        }
+
+        if (!ours)
+            manifest.REFrameworkPreexisting = REFrameworkArtifacts(exeDir).Select(p => Path.GetFileName(p)).ToList();
+        PlaceFile(pkg.DllPath, exeDir, name, manifest);
+        var result = manifest.REFrameworkVersion.Length == 0 ? RefResult.Installed : RefResult.Updated;
+        manifest.REFrameworkVersion = pkg.Version;
+        manifest.Save(exeDir);
+        HideREFrameworkMenuAtStartup(exeDir, manifest);
+        Log.Info($"REFramework {pkg.Version} {(result == RefResult.Installed ? "added to" : "updated in")} {exeDir}");
+        return result;
+    }
+
+    /// <summary>
+    /// REFramework opens its menu on every launch by default. Its config (re2_fw_config.txt next to the exe, the same name
+    /// for every game) can make it start closed: with RememberMenuState on it restores the saved MenuOpen state at launch.
+    /// Only written for configs FSR 4.1 Lite owns, never one the player already had; Insert still opens the menu.
+    /// Call only while the game isn't running (REFramework saves its own config while it runs).
+    /// </summary>
+    private static void HideREFrameworkMenuAtStartup(string exeDir, InstallManifest manifest)
+    {
+        const string configName = "re2_fw_config.txt";
+        if (manifest.REFrameworkPreexisting.Contains(configName, StringComparer.OrdinalIgnoreCase)) return;
+        var path = Path.Combine(exeDir, configName);
+        try
+        {
+            var lines = File.Exists(path) ? File.ReadAllLines(path).ToList() : new List<string>();
+            var changed = false;
+            foreach (var (key, value) in new[] { ("REFrameworkConfig_RememberMenuState", "true"), ("REFrameworkConfig_MenuOpen", "false") })
+            {
+                var i = lines.FindIndex(l => l.StartsWith(key + "=", StringComparison.Ordinal));
+                var line = $"{key}={value}";
+                if (i < 0) { lines.Add(line); changed = true; }
+                else if (lines[i] != line) { lines[i] = line; changed = true; }
+            }
+            if (changed) File.WriteAllLines(path, lines);
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"Couldn't set REFramework's menu to start closed in {exeDir}: {ex.Message}");
+        }
+    }
+
+    /// <summary>REFramework's runtime files next to the exe: the reframework folder, *_fw_config/log files, its log.</summary>
+    private static IEnumerable<string> REFrameworkArtifacts(string exeDir)
+    {
+        if (!Directory.Exists(exeDir)) yield break;
+        var dir = Path.Combine(exeDir, "reframework");
+        if (Directory.Exists(dir)) yield return dir;
+        foreach (var file in Directory.GetFiles(exeDir))
+        {
+            var n = Path.GetFileName(file);
+            if (System.Text.RegularExpressions.Regex.IsMatch(n, @"^(re\d*_?framework.*|[a-z0-9]+_fw_(config|log).*)\.(txt|log|json)$",
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+                yield return file;
+        }
+    }
+
+    /// <summary>
+    /// The loader name to install as, the first of these that's free in the folder:
+    /// 1. the name a game needs (GameRules, e.g. winmm.dll for Red Dead Redemption 2);
+    /// 2. the name that worked last time this game was installed (LoaderMemory);
+    /// 3. for Game Pass games whose exe doesn't import dxgi.dll (they often skip it), a name the exe does import;
+    /// 4. the usual order, dxgi.dll first. If the game ignores it, the game watcher switches by itself.
+    /// </summary>
+    public static string PickProxyName(string exeDir, string? exeName = null, GameSource source = GameSource.Manual)
+    {
+        bool Free(string n) => !File.Exists(Path.Combine(exeDir, n));
+
+        if (GameRules.LoaderFor(exeName) is { } wanted && Free(wanted)) return wanted;
+        if (LoaderMemory.Recall(exeName) is { } remembered && Free(remembered)) return remembered;
+
+        if (source == GameSource.Xbox)
+        {
+            var imports = ImportsOf(exeDir, exeName);
+            if (!imports.Dlls.Contains("dxgi.dll") &&
+                InstallConfig.ProxyNames.FirstOrDefault(n => imports.Dlls.Contains(n) && Free(n)) is { } imported)
+            {
+                Log.Info($"{exeName} doesn't import dxgi.dll; starting with {imported}, which it does");
+                return imported;
+            }
+        }
+
+        return InstallConfig.ProxyNames.FirstOrDefault(Free)
+               ?? throw new InvalidOperationException("Every OptiScaler file name is already taken in this folder.");
+    }
+
+    private static void PlaceFile(string source, string exeDir, string rel, InstallManifest manifest)
+    {
+        var target = Path.Combine(exeDir, rel);
+        EnsureDirs(exeDir, Path.GetDirectoryName(rel), manifest);
+
+        if (File.Exists(target))
+        {
+            if (!manifest.CreatedFiles.Contains(rel, StringComparer.OrdinalIgnoreCase) &&
+                !manifest.BackedUpFiles.Contains(rel, StringComparer.OrdinalIgnoreCase))
+            {
+                var backup = Path.Combine(InstallManifest.BackupDir(exeDir), rel);
+                Directory.CreateDirectory(Path.GetDirectoryName(backup)!);
+                File.Copy(target, backup, overwrite: true);
+                manifest.BackedUpFiles.Add(rel);
+                manifest.Save(exeDir);
+            }
+        }
+        else
+        {
+            RecordNewFile(exeDir, rel, manifest);
+        }
+
+        File.Copy(source, target, overwrite: true);
+    }
+
+    private static void RecordNewFile(string exeDir, string rel, InstallManifest manifest)
+    {
+        if (manifest.CreatedFiles.Contains(rel, StringComparer.OrdinalIgnoreCase)) return;
+        manifest.CreatedFiles.Add(rel);
+        manifest.Save(exeDir);
+    }
+
+    private static void EnsureDirs(string exeDir, string? relDir, InstallManifest manifest)
+    {
+        if (string.IsNullOrEmpty(relDir)) return;
+        var parts = relDir.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var current = "";
+        foreach (var part in parts)
+        {
+            current = current.Length == 0 ? part : Path.Combine(current, part);
+            var full = Path.Combine(exeDir, current);
+            if (Directory.Exists(full)) continue;
+            Directory.CreateDirectory(full);
+            manifest.CreatedDirs.Add(current);
+            manifest.Save(exeDir);
+        }
+    }
+
+    /// <summary>
+    /// Removes a folder FSR 4.1 Lite created, with everything in it, except a plugins folder holding the player's own
+    /// files (ASI plugins or ReShade they added for OptiScaler to load): that one and the folders above it stay.
+    /// </summary>
+    private static void DeleteCreatedDir(string dir)
+    {
+        var plugins = Path.Combine(dir, "plugins");
+        if (!Directory.Exists(plugins) || !Directory.EnumerateFileSystemEntries(plugins).Any())
+        {
+            Directory.Delete(dir, recursive: true);
+            return;
+        }
+        foreach (var entry in Directory.EnumerateFileSystemEntries(dir).ToList())
+        {
+            if (Path.GetFileName(entry).Equals("plugins", StringComparison.OrdinalIgnoreCase)) continue;
+            if (Directory.Exists(entry)) Directory.Delete(entry, recursive: true);
+            else DeleteFile(entry);
+        }
+        Log.Info($"Kept {plugins}: it has files FSR 4.1 Lite didn't add");
+    }
+
+    public const string OptiPatcherName = "OptiPatcher.asi";
+
+    /// <summary>
+    /// Where OptiPatcher goes in a game: the plugins folder OptiScaler reads ASI plugins from. OptiScaler v10 looks in
+    /// "plugins" under its OptiDllPath, which is the OptiScaler folder next to the exe when that exists (OptiScaler's
+    /// dllmain.cpp: PluginPath defaults to MainDllPath\plugins); older installs without it use the exe folder's plugins.
+    /// </summary>
+    public static string OptiPatcherRel(string exeDir) =>
+        Directory.Exists(Path.Combine(exeDir, InstallConfig.OptiSubfolder))
+            ? Path.Combine(InstallConfig.OptiSubfolder, "plugins", OptiPatcherName)
+            : Path.Combine("plugins", OptiPatcherName);
+
+    public static readonly InstallConfig.IniValue LoadAsiPlugins = new("Plugins", "LoadAsiPlugins", "true");
+
+    /// <summary>
+    /// Adds OptiPatcher to a game FSR 4.1 Lite set up, brings it to another release, or puts it back when it's gone
+    /// (a game update or file check removed it). Turns on LoadAsiPlugins in OptiScaler.ini. Tracked in the manifest so
+    /// uninstall removes it, and its plugins folder if FSR 4.1 Lite made it and it's empty. A player's own
+    /// OptiPatcher.asi in that folder is left as is. Returns true when the file was added or replaced.
+    /// The game must not be running.
+    /// </summary>
+    public static bool AddOptiPatcher(string exeDir, OptiPatcherFile op)
+    {
+        var manifest = InstallManifest.TryLoad(exeDir) ?? throw new InvalidOperationException("FSR 4.1 Lite isn't installed here.");
+        var rel = manifest.OptiPatcherFile.Length > 0 ? manifest.OptiPatcherFile : OptiPatcherRel(exeDir);
+        var target = Path.Combine(exeDir, rel);
+        var ini = Path.Combine(exeDir, "OptiScaler.ini");
+        var ours = manifest.CreatedFiles.Contains(rel, StringComparer.OrdinalIgnoreCase);
+
+        if (File.Exists(target) && (!ours || manifest.OptiPatcherVersion.Equals(op.Tag, StringComparison.Ordinal)))
+        {
+            // Current, or the player's own copy: only make sure OptiScaler loads it.
+            if (File.Exists(ini)) IniFile.SetValues(ini, new[] { LoadAsiPlugins });
+            return false;
+        }
+
+        var plugins = Path.GetDirectoryName(target)!;
+        if (!Directory.Exists(plugins))
+        {
+            Directory.CreateDirectory(plugins);
+            if (!ours) manifest.OptiPatcherMadePluginsDir = true;
+        }
+        if (!ours) manifest.CreatedFiles.Add(rel);
+        manifest.OptiPatcherFile = rel;
+        manifest.Save(exeDir); // recorded before the file lands, so a failed copy still uninstalls cleanly
+
+        File.Copy(op.AsiPath, target, overwrite: true);
+        if (File.Exists(ini)) IniFile.SetValues(ini, new[] { LoadAsiPlugins });
+        var previous = manifest.OptiPatcherVersion;
+        manifest.OptiPatcherVersion = op.Tag;
+        manifest.Save(exeDir);
+        Log.Info(!ours ? $"OptiPatcher {op.Tag} added to {exeDir} ({rel})"
+            : previous == op.Tag ? $"OptiPatcher {op.Tag} put back in {exeDir}"
+            : $"OptiPatcher in {exeDir}: {previous} -> {op.Tag}");
+        return true;
+    }
+
+    private static void DeleteFile(string path)
+    {
+        if (!File.Exists(path)) return;
+        File.SetAttributes(path, FileAttributes.Normal);
+        File.Delete(path);
+    }
+}
